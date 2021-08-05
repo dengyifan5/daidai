@@ -1,0 +1,217 @@
+import pandas as pd
+import copy
+from diagnosis_risk.var_diagnosis_v3 import var_diagnosis
+
+
+class DataPreparing(object):
+    def __init__(self, _data, _label, _date_col, _tim_list):
+        self._data = _data
+        # 分析指标label
+        self.label = _label
+        self.date_col = _date_col
+        self.tim_list = _tim_list
+
+    def data_cleansing(self):
+        """
+        获取分析起始时间和结束时间, 数据清洗，格式化输出, 字符数字类型转换为可计算类型
+        :return: start_time 起始时间, end_time 结束时间, meta_data 处理好可供分析数据
+        """
+        start_time = self._data[self.date_col].min()
+        end_time = self._data[self.date_col].max()
+        self._data[self.date_col] = self._data[self.date_col].astype(str)
+        for col in self._data.columns:
+            try:
+                self._data[col] = self._data[col].astype(float)
+            except Exception:
+                pass
+        meta_data = copy.copy(self._data)
+        return start_time, end_time, meta_data
+
+    def init_diagnosis(self):
+        """
+        实例化分诊器
+        :return:
+        """
+        _, _, meta_data = self.data_cleansing()
+        vd = var_diagnosis(meta_data,
+                           obs_stt_date=self.tim_list[0],
+                           obs_end_date=self.tim_list[1],
+                           cmp_stt_date=self.tim_list[2],
+                           cmp_end_date=self.tim_list[3],
+                           pfm_prd=0,
+                           date_col=self.date_col)
+        return vd, meta_data
+
+
+class AutoAnalysis(DataPreparing):
+    def __init__(self, _data, _label, _date_col, _tim_list, _auto_analyzed_dimensions):
+        super().__init__(_data, _label, _date_col, _tim_list)
+        self.auto_analyzed_dimensions = _auto_analyzed_dimensions
+
+    def analysis_dat(self):
+        """
+        自动选取最高基尼系数分析
+        :return: 基尼系数：gini_out_autoed      δ值：delta_output_autoed
+        """
+        delta_output_autoed = pd.DataFrame()
+        gini_out_autoed = pd.DataFrame()
+        summary_autoed = pd.DataFrame()
+        engine, meta_data = self.init_diagnosis()
+        level = 1
+        filter_dic = {}
+        while len(self.auto_analyzed_dimensions) > 0:
+            summary, delta_drill_down, df_gini = engine.auto_drilldown(label=self.label,
+                                                                       dim_col_list=self.auto_analyzed_dimensions,
+                                                                       flt=filter_dic,
+                                                                       value_drilldown=True)
+
+            delta_drill_down = delta_drill_down.sort_values(by=['gini', 'delta'], ascending=[False, True],
+                                                            ignore_index=True)
+
+            # 取最大基尼系数因素
+            col = delta_drill_down.loc[0, 'dim_col']
+
+            # 删除已分析项
+            self.auto_analyzed_dimensions.remove(col)
+
+            # 输出的塔尔值
+            delta_drill_down['level'] = level
+            delta_output_autoed = delta_output_autoed.append(delta_drill_down)
+
+            # 输出基尼系数
+            df_gini['level'] = level
+            gini_out_autoed = gini_out_autoed.append(df_gini)
+
+            # 输出summary
+            summary['level'] = level
+            summary_autoed = summary_autoed.append(summary)
+
+            # 最大分支 加入过滤条件字典
+            ls = delta_drill_down.reset_index().loc[0, 'dim_grp']
+            filter_dic[col] = [ls]
+            level += 1
+
+        return delta_output_autoed, gini_out_autoed, summary_autoed
+
+
+class FixedAnalysis(DataPreparing):
+    def __init__(self, _data, _label, _date_col, _tim_list, _analyzed_dimensions):
+        super().__init__(_data, _label, _date_col, _tim_list)
+        self.analyzed_dimensions = _analyzed_dimensions
+
+    @staticmethod
+    def get_last_level(analyzed_dimensions, meta_data):
+        """
+        获取分析维度最后一层，备后续使用。
+        :param analyzed_dimensions:
+        :param meta_data:
+        :return:
+        """
+        import itertools
+        import ast
+
+        # 求原始数据中分析列的各维度
+        ori_col = {}
+        col = []
+        for k, v in analyzed_dimensions.items():
+            all_inf_ele = list(set(meta_data.loc[:, v].values))
+            ori_col[v] = all_inf_ele
+            col.append(v)
+        # 获取最终一层组合筛选条件last_level
+        tmp_list = []
+        for k, v in ori_col.items():
+            tmp_list.append(v)
+        last_level = list(itertools.product(*tmp_list))
+        last_dic_out = []
+        # 调整格式输出
+        # 创建每层过滤条件
+        for lev in last_level:
+            # tuple to list
+            lis_ele = [[i] for i in lev]
+
+            # 复制临时col
+            tmp_col = copy.deepcopy(col)
+            while len(tmp_col) > 0:
+                last_dic_level = dict(zip(tmp_col, lis_ele))
+                tmp_col.pop()
+                last_dic_out.append(last_dic_level)
+        # 去重
+        to_string = [str(i) for i in last_dic_out]
+        distinct_list = set(to_string)
+        last_dic_output = [ast.literal_eval(i) for i in distinct_list]
+
+        return last_dic_output, len(last_dic_output)
+
+    def analysis_dat(self):
+        """
+        固定路径分析，首复借 fst_lon_flg 新旧户 new_cus_flg 产品类型 bsy_cls 一级渠道 adt_lv1_cls 二级渠道 adt_lv2_cls 分期期数 stg_typ
+        :return:基尼系数：gini_out_fixed      δ值：delta_output_fixed
+        """
+        delta_output_fixed = pd.DataFrame()
+        gini_out_fixed = pd.DataFrame()
+        summary_fixed = pd.DataFrame()
+        engine, meta_data = self.init_diagnosis()
+        # 固定路径分析，需加层级
+        var_filter_level, len_filter = self.get_last_level(self.analyzed_dimensions, meta_data)
+        var_filter_level = sorted(var_filter_level, key=lambda x: len(x))
+
+        # 固定路径分析，需加层级
+        filter_dic = {}
+        for k, v in self.analyzed_dimensions.items():
+            anal_list = [v]
+            ln = list(filter(lambda s: isinstance(s, dict) and len(s) == k - 1, var_filter_level))
+            if k == 1:
+                try:
+                    summary, delta_drill_down, df_gini = engine.auto_drilldown(label=self.label, dim_col_list=anal_list,
+                                                                               flt=filter_dic, value_drilldown=True)
+                except IndexError as e:
+                    continue
+                # 增加标识列
+                style = '首逾by'
+
+                # 输出的塔尔值
+                delta_drill_down['level'] = k
+                delta_drill_down['name'] = style
+                delta_output_fixed = delta_output_fixed.append(delta_drill_down)
+
+                # 输出基尼系数
+                df_gini['level'] = k
+                df_gini['name'] = style
+                gini_out_fixed = gini_out_fixed.append(df_gini)
+
+                # 输出summary
+                summary['level'] = k
+                summary['name'] = style
+                summary_fixed = summary_fixed.append(summary)
+            else:
+                for filter_dict in ln:
+                    try:
+                        summary, delta_drill_down, df_gini = engine.auto_drilldown(label=self.label,
+                                                                                   dim_col_list=anal_list,
+                                                                                   flt=filter_dict,
+                                                                                   value_drilldown=True)
+                    except:
+                        continue
+
+                    # 增加标识列
+                    style = '首逾by'
+                    for i in filter_dict.values():
+                        style = style + i[0] + 'by'
+                    # 输出的塔尔值
+                    delta_drill_down['level'] = k
+                    delta_drill_down['name'] = style
+                    delta_output_fixed = delta_output_fixed.append(delta_drill_down)
+
+                    # 输出基尼系数
+                    df_gini['level'] = k
+                    df_gini['name'] = style
+                    gini_out_fixed = gini_out_fixed.append(df_gini)
+
+                    # 输出summary
+                    summary['level'] = k
+                    summary['name'] = style
+                    summary_fixed = summary_fixed.append(summary)
+
+        delta_output_fixed.dropna(subset=['gini'], inplace=True)
+        gini_out_fixed.dropna(subset=['gini'], inplace=True)
+        return delta_output_fixed, gini_out_fixed, summary_fixed
