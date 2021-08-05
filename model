@@ -1,0 +1,477 @@
+import time
+from datetime import datetime
+from datetime import timedelta
+import copy
+import pandas as pd
+import numpy as np
+import os
+import plotly.graph_objects as go
+
+
+class var_diagnosis:
+
+    def __init__(self,
+                 df,
+                 date_col,
+                 pfm_prd,
+                 obs_stt_date,
+                 obs_end_date,
+                 cmp_stt_date,
+                 cmp_end_date):
+        self.df = df
+        self.date_col = date_col
+        self.pfm_prd = pfm_prd
+        self.obs_stt_date = obs_stt_date
+        self.obs_end_date = obs_end_date
+        self.cmp_stt_date = cmp_stt_date
+        self.cmp_end_date = cmp_end_date
+        '''
+        df:数据集
+        date_col: 数据集时间基准列名
+        pfm_prd:表现期(仅在底层表各指标字段数据类型为日期时有效)
+        obs_stt_date,obs_end_date,cmp_stt_date,cmp_end_date: 观察期起始日期,观察期结束日期, 比较期起始日期,比较期结束日期
+        '''
+
+    def getBetweenDay(self, begin_date, end_date):
+        '''返回两个日期之间所有日期的list
+        begin_date:起始日期
+        end_date:结束日期
+        example: getBetweenDay('2021-01-01','2021-01-05')
+        return: ['2021-01-01'.'2021-01-02','2021-01-03','2021-01-04','2021-01-05']
+        '''
+        date_list = []
+        while begin_date <= end_date:
+            date_str = begin_date.strftime("%Y-%m-%d")
+            date_list.append(date_str)
+            begin_date += timedelta(days=1)
+        return date_list
+
+    def get_label_columns(self, flow_start, flow_end, df):
+        '''返回带标签列的数据集,分诊器专用
+        flow_start: 业务流起点列 （如首登时间）
+        flow_end:业务流终点列 （如申完时间）
+        '''
+        df_new = copy.deepcopy(df)
+
+        df_new[self.date_col] = pd.to_datetime(df_new[self.date_col])
+        df_new[flow_end] = pd.to_datetime(df_new[flow_end])
+        df_new[flow_start] = pd.to_datetime(df_new[flow_start])
+
+        df_new['label_td_end'] = (df_new[flow_end] - df_new[self.date_col]).dt.days
+        df_new['label_td_stt'] = (df_new[flow_start] - df_new[self.date_col]).dt.days
+        df_new['label'] = None
+
+        idx1 = df_new[df_new['label_td_end'] <= self.pfm_prd].index
+        idx0 = df_new[((df_new['label_td_end'] > self.pfm_prd)
+                       | ((df_new[flow_end].isnull() == True)
+                          & (df_new[flow_start].isnull() == False)))
+                      & (df_new['label_td_stt'] <= self.pfm_prd)].index
+
+        df_new.loc[idx1, 'label'] = 1
+        df_new.loc[idx0, 'label'] = 0
+
+        return list(df_new['label'])
+
+    def flt_df(self, flt):
+        '''
+        筛选数据集，按照观察对比日期范围和flt,输出筛选后数据集,和观察期对比期时间范围（因为外层函数需要用到）
+        '''
+        df_new = copy.deepcopy(self.df)
+
+        for k in flt.keys():
+            try:
+                df_new = df_new[df_new[k].isin(flt[k]) == True]
+            except:
+                pass
+
+        df_new[self.date_col] = df_new[self.date_col].astype(str)
+
+        obs_stt_date = datetime.strptime(self.obs_stt_date, "%Y-%m-%d")
+        obs_end_date = datetime.strptime(self.obs_end_date, "%Y-%m-%d")
+
+        cmp_stt_date = datetime.strptime(self.cmp_stt_date, "%Y-%m-%d")
+        cmp_end_date = datetime.strptime(self.cmp_end_date, "%Y-%m-%d")
+        obs_date = self.getBetweenDay(obs_stt_date, obs_end_date)
+        cmp_date = self.getBetweenDay(cmp_stt_date, cmp_end_date)
+
+        df_new = df_new[(df_new[self.date_col].isin(obs_date + cmp_date) == True)].reset_index(drop=True)
+
+        obs_idx = df_new[df_new[self.date_col].isin(obs_date) == True].index
+        cmp_idx = df_new[df_new[self.date_col].isin(cmp_date) == True].index
+
+        df_new['grp'] = None
+
+        df_new.loc[obs_idx, 'grp'] = 'obs'
+        df_new.loc[cmp_idx, 'grp'] = 'cmp'
+        return df_new, obs_date, cmp_date
+
+    def flow_analyse(self, mltplr_list, flow_list, flt={}, value_analysis=False):
+        '''返回业务流拆解,用循环替代法实现
+        mltplr_list: 数据级中连乘因子列名list
+        flow_list: 数据集中待拆解的业务流环节列名list,必须按照顺序排列
+        flt: 数据筛选条件，用字典表示，字典中每个key代表带筛选字段，key对应的value类型为list，代表需要保留的值，例如：{'lv1_cls':['今日头条','朋友圈']}
+        value_analysis: bool值，代表是否按数值拆解（仅在底层表各指标字段数据类型为日期时需要设置为False)
+        '''
+        df_new, obs_date, cmp_date = self.flt_df(flt)
+        for c in mltplr_list + flow_list:
+            df_new[c] = df_new[c].astype(float)
+
+        flow_length = len(flow_list)
+
+        if value_analysis:
+            df_new['label'] = df_new[flow_list[-1]]
+        else:
+            df_new['label'] = self.get_label_columns(flow_list[0], flow_list[-1], df_new)
+
+        i = 0
+        label_list = []
+        while i + 1 <= flow_length - 1:
+            if value_analysis:
+                df_new['label_' + str(i) + '_' + str(i + 1)] = df_new[flow_list[i + 1]]
+
+            else:
+                df_new['label_' + str(i) + '_' + str(i + 1)] = self.get_label_columns(flow_list[i], flow_list[i + 1],
+                                                                                      df_new)
+            label_list.append('label_' + str(i) + '_' + str(i + 1))
+            try:
+                err_idx = df_new[df_new['label_' + str(i) + '_' + str(i + 1)] < df_new[
+                    'label_' + str(i + 1) + '_' + str(i + 2)]].index
+                df_new.loc[err_idx, 'label_' + str(i) + '_' + str(i + 1)] = df_new.loc[
+                    err_idx, 'label_' + str(i + 1) + '_' + str(i + 2)]
+            except:
+                pass
+            i = i + 1
+
+        if value_analysis:
+            summary = df_new.groupby('grp')[label_list + ['label'] + flow_list].sum()
+            i = 0
+            while i + 1 <= flow_length - 1:
+                summary['label_' + str(i) + '_' + str(i + 1)] = summary['label_' + str(i) + '_' + str(i + 1)] / summary[
+                    flow_list[i]]
+                i = i + 1
+            summary['label'] = summary['label'] / summary[flow_list[0]]
+            summary = summary.drop(flow_list, axis=1)
+        else:
+            summary = df_new.groupby('grp')[label_list + ['label']].mean()
+
+        summary[mltplr_list] = df_new.groupby('grp')[mltplr_list].sum()
+        summary['label'] = summary[mltplr_list + ['label']].product(axis=1)
+        summary = summary[mltplr_list + label_list + ['label']]
+
+        summary_sub = summary.drop('label', axis=1)
+
+        ctb_list = []
+        for l in mltplr_list + label_list:
+            ctb = np.product(summary_sub.loc['cmp', :]) / summary.loc['cmp', l] * summary_sub.loc[
+                'obs', l] - np.product(summary_sub.loc['cmp', :])
+            ctb_list.append(ctb)
+            summary_sub.loc['cmp', l] = summary_sub.loc['obs', l]
+
+        delta = round(summary.loc['obs', 'label'] - summary.loc['cmp', 'label'], 6)
+        ctb_list = [round(x, 6) for x in ctb_list]
+
+        df_ctb = pd.DataFrame({'label': mltplr_list + label_list,
+                               'ctb': ctb_list})
+
+        return summary, df_ctb
+
+    def gini(self, x, w=None):
+        '''计算gini系数'''
+        # The rest of the code requires numpy arrays.
+        x = np.asarray(x)
+        if w is not None:
+            w = np.asarray(w)
+            sorted_indices = np.argsort(x)
+            sorted_x = x[sorted_indices]
+            sorted_w = w[sorted_indices]
+            # Force float dtype to avoid overflows
+            cumw = np.cumsum(sorted_w, dtype=float)
+            cumxw = np.cumsum(sorted_x * sorted_w, dtype=float)
+            return (np.sum(cumxw[1:] * cumw[:-1] - cumxw[:-1] * cumw[1:]) /
+                    (cumxw[-1] * cumw[-1]))
+        else:
+            sorted_x = np.sort(x)
+            n = len(x)
+            cumx = np.cumsum(sorted_x, dtype=float)
+            # The above formula, with all weights equal to 1 simplifies to:
+            return (n + 1 - 2 * np.sum(cumx) / cumx[-1]) / n
+
+    def auto_drilldown(self, label, dim_col_list, flt={}, value_drilldown=False):
+        '''返回下钻维度拆解,用权重拆分法实现,并展示不同维度的基尼系数排序
+        label: 待拆分的指标, 用[分母,分子]的形式输入
+        dim_col_list:拆分维度列名list
+        flt: 数据筛选条件，用字典表示，字典中每个key代表带筛选字段，key对应的value类型为list，代表需要保留的值，例如：{'lv1_cls':['今日头条','朋友圈']}
+        value_drilldown: bool值，代表是否按数值拆解（仅在底层表各指标字段数据类型为日期时需要设置为False)
+        '''
+        df_new, obs_date, cmp_date = self.flt_df(flt)
+
+        for c in dim_col_list:
+            df_new[c] = df_new[c].astype(str)
+
+        for c in label:
+            df_new[c] = df_new[c].astype(float)
+
+        if value_drilldown:
+            df_new['label'] = df_new[label[0]]
+            df_new['cnt'] = df_new[label[-1]]
+        else:
+            df_new['label'] = self.get_label_columns(label[0], label[-1], df_new)
+
+            df_new['cnt'] = 1
+
+        try:
+            err_idx = df_new[df_new['cnt'] < df_new['label']].index
+            df_new.loc[err_idx, 'cnt'] = df_new.loc[err_idx, 'label']
+        except:
+            pass
+
+        df_summary = pd.DataFrame()
+        df_delta_drilldown = pd.DataFrame()
+
+        for dim_col in dim_col_list:
+            df_new[dim_col] = df_new[dim_col].fillna('NA')
+            summary = df_new.groupby(['grp', dim_col])[['label', 'cnt']].sum().reset_index()
+
+            cmp_missing_bin = summary[summary.grp == 'obs'][dim_col].isin(summary[summary.grp == 'cmp'][dim_col])
+            cmp_missing_bin = summary.loc[cmp_missing_bin[cmp_missing_bin == False].index, dim_col].to_list()
+
+            obs_missing_bin = summary[summary.grp == 'cmp'][dim_col].isin(summary[summary.grp == 'obs'][dim_col])
+            obs_missing_bin = summary.loc[obs_missing_bin[obs_missing_bin == False].index, dim_col].to_list()
+
+            for c in cmp_missing_bin:
+                summary = summary.append(pd.DataFrame({'grp': 'cmp',
+                                                       dim_col: c,
+                                                       'label': 0,
+                                                       'cnt': 0,
+                                                       'rate': 0}, index=[0]))
+
+            for c in obs_missing_bin:
+                summary = summary.append(pd.DataFrame({'grp': 'obs',
+                                                       dim_col: c,
+                                                       'label': 0,
+                                                       'cnt': 0,
+                                                       'rate': 0}, index=[0]))
+
+            if len(label) != 1:
+                summary['rate'] = summary['label'] / summary['cnt']
+            else:
+                summary['rate'] = summary['label']
+            summary['weight'] = None
+            summary['weight_value'] = None
+            summary['weight_value_rate'] = None
+            summary['rate'] = summary['rate'].fillna(0)
+            summary = summary.sort_values(by=['grp', dim_col])
+            summary = summary.reset_index(drop=True)
+
+            summary_total = summary.groupby('grp')[['label', 'cnt']].sum()
+            if len(label) != 1:
+                summary_total['rate'] = summary_total['label'] / summary_total['cnt']
+            else:
+                summary_total['rate'] = summary_total['label']
+
+            summary_total[dim_col] = 'total'
+            dim_grp_cnt = len(summary[dim_col].drop_duplicates())
+
+            idx_cmp = summary[summary['grp'] == 'cmp'].index
+            idx_obs = summary[summary['grp'] == 'obs'].index
+
+            summary.loc[idx_cmp, 'weight'] = summary.loc[idx_cmp, 'cnt'] / summary.groupby('grp')['cnt'].sum()['cmp']
+            summary.loc[idx_obs, 'weight'] = summary.loc[idx_obs, 'cnt'] / summary.groupby('grp')['cnt'].sum()['obs']
+
+            summary.loc[idx_cmp, 'weight_value'] = summary.loc[idx_cmp, 'weight'] * (
+                    summary.loc[idx_cmp, 'rate'] - summary_total.loc['cmp', 'rate'])
+            summary.loc[idx_obs, 'weight_value'] = summary.loc[idx_obs, 'weight'] * (
+                    summary.loc[idx_obs, 'rate'] - summary_total.loc['obs', 'rate'])
+
+            summary.loc[idx_obs, 'weight_value_rate'] = summary.loc[idx_cmp, 'weight'].values * (
+                    summary.loc[idx_obs, 'rate'] - summary_total.loc['obs', 'rate'])
+
+            sum_temp = pd.merge(summary[summary['grp'] == 'obs'], summary[summary['grp'] == 'cmp'], on=dim_col,
+                                how='inner')
+
+            bias = (summary_total.loc['obs', 'rate'] - summary_total.loc['cmp', 'rate']) / dim_grp_cnt
+
+            if len(label) != 1:
+                sum_temp['delta_rate'] = sum_temp['weight_value_rate_x'] - sum_temp['weight_value_y'] + bias / 2
+                sum_temp['delta_weight'] = sum_temp['weight_value_x'] - sum_temp['weight_value_rate_x'] + bias / 2
+                sum_temp['delta'] = sum_temp['delta_rate'] + sum_temp['delta_weight']
+
+            else:
+                sum_temp['delta'] = sum_temp['label_x'] - sum_temp['label_y']
+                sum_temp['delta_rate'] = sum_temp['delta']
+                sum_temp['delta_weight'] = sum_temp['delta']
+
+            ###新增数值拆分功能
+            sum_temp['delta_num'] = (sum_temp['label_x'] / len(obs_date)) - (sum_temp['label_y'] / len(cmp_date))
+            sum_temp['delta_den'] = (sum_temp['cnt_x'] / len(obs_date)) - (sum_temp['cnt_y'] / len(cmp_date))
+
+            delta_drilldown = sum_temp[[dim_col, 'delta', 'delta_rate', 'delta_weight', 'delta_num', 'delta_den']]
+
+            summary = summary.append(summary_total.reset_index())
+            summary = summary.reset_index(drop=True)
+
+            obs_idx = summary[(summary['grp'] == 'obs') & (summary[dim_col] == 'total')].index
+            cmp_idx = summary[(summary['grp'] == 'cmp') & (summary[dim_col] == 'total')].index
+            delta = round(summary.loc[obs_idx, 'rate'].iloc[0] - summary.loc[cmp_idx, 'rate'].iloc[0], 6)
+
+            if delta >= 0:
+                delta_drilldown = delta_drilldown.sort_values(by='delta', ascending=False)
+            else:
+                delta_drilldown = delta_drilldown.sort_values(by='delta', ascending=True)
+
+            summary['dim_col'] = dim_col
+            delta_drilldown['dim_col'] = dim_col
+            delta_list = delta_drilldown['delta']  # - delta_drilldown['delta'].min()
+            delta_list = delta_list.values
+            delta_list = list(delta_list[~pd.isna(delta_list)])
+            gini = self.gini(delta_list)
+            delta_drilldown['gini'] = gini
+
+            summary['dim_grp'] = summary[dim_col]
+            delta_drilldown['dim_grp'] = delta_drilldown[dim_col]
+
+            summary = summary.drop(dim_col, axis=1)
+            delta_drilldown = delta_drilldown.drop(dim_col, axis=1)
+
+            df_summary = df_summary.append(summary.drop('weight_value_rate', axis=1))
+            df_delta_drilldown = df_delta_drilldown.append(delta_drilldown)
+
+        # df_gini = df_delta_drilldown.groupby('dim_col')['gini'].mean().sort_values(ascending = False)
+        df_gini = df_delta_drilldown[['dim_col', 'gini']].drop_duplicates().sort_values(by='gini', ascending=False)
+
+        return df_summary, df_delta_drilldown, df_gini
+
+    def drilldown_tree(self, label, dim_col_list, flt=None, iter_tim=1, value_drilldown=False):
+        '''功能为基于auto_drilldown方法进行自动下钻，每次迭代会筛选上一层gini最高的变量中贡献最显著的分组进行下钻，
+        iter_tim参数，表示下钻层数，其他参数和auto_drilldown含义一致
+        '''
+
+        summary_cmb = pd.DataFrame()
+        delta_drilldown_cmb = pd.DataFrame()
+        df_gini_cmb = pd.DataFrame()
+
+        for i in np.arange(0, iter_tim):
+            try:
+
+                summary, delta_drilldown, df_gini = self.auto_drilldown(label, dim_col_list, flt=flt,
+                                                                        value_drilldown=True)
+
+                summary['layer'] = i
+                delta_drilldown['layer'] = i
+                df_gini = df_gini
+                df_gini['layer'] = i
+
+                if df_gini['gini'].sum() == 0:
+                    break
+
+                summary_cmb = summary_cmb.append(summary)
+                delta_drilldown_cmb = delta_drilldown_cmb.append(delta_drilldown)
+                df_gini_cmb = df_gini_cmb.append(df_gini)
+
+                nxt_dim = df_gini['dim_col'].values[0]
+                flt_grp = delta_drilldown[delta_drilldown.dim_col == nxt_dim]['dim_grp'].iloc[0]
+
+                dim_col_list = list(set(dim_col_list).difference(set(nxt_dim)))
+                print(dim_col_list)
+                flt = dict(flt, **{nxt_dim: [flt_grp]})
+                print('running iter ' + str(i))
+            except:
+                break
+
+        return summary_cmb, delta_drilldown_cmb, df_gini_cmb
+
+    def go_waterfall(self, df, stt_point, end_point, data_col, grp_col, title=None):
+        '''画图功能，生成瀑布图（仅在jupyter预发布环境可用）
+        df:画图基于的数据集，一般为维度下钻或者流程拆解的输出结果
+        stt_point: 瀑布图起点数值，数据类型为float
+        end_point: 瀑布图终点数值，数据类型为float
+        data_col: 选择df数据集中哪一列作为瀑布数据
+        grp_col: 选择df数据集中哪一列作为瀑布分组
+        title: 图标标题
+        '''
+        data = [round(x, 6) for x in [stt_point] + list(df[data_col]) + [end_point]]
+
+        fig = go.Figure(go.Waterfall(
+            name="contribution", orientation="v",
+            measure=["relative"] + ['relative'] * len(df[data_col]) + ["total"],
+            x=["label_0"] + list(df[grp_col]) + ["label_1"],
+            textposition="outside",
+            text=[str(x) for x in data],
+            y=data,
+            connector={"line": {"color": "rgb(63, 63, 63)"}}))
+
+        fig.update_layout(
+            title=title,
+            showlegend=True)
+
+        return fig
+
+    def waterfall_drilldown(self, summary, delta_drilldown, split=False):
+        '''画图功能，生成瀑布图（仅在jupyter预发布环境可用）
+        更新版：拆分两种核心方法，维度拆解画图可以选择是否拆分rate和weight的贡献
+        summary：维度拆解方法输出参数1
+        delta_drilldown：summary：维度拆解方法输出参数2
+        '''
+        stt_point = summary[(summary['dim_grp'] == 'total') & (summary['grp'] == 'cmp')]['rate'].values[0]
+        end_point = summary[(summary['dim_grp'] == 'total') & (summary['grp'] == 'obs')]['rate'].values[0]
+
+        if split:
+            y = [stt_point] + list(delta_drilldown['delta_rate']) + list(delta_drilldown['delta_weight']) + [end_point]
+            y = [round(y, 6) for y in y]
+            x = ['cmp_value'] + list(delta_drilldown['dim_grp'] + '_rate') + list(
+                delta_drilldown['dim_grp'] + '_weight') + ['obs_value']
+        else:
+            y = [stt_point] + list(delta_drilldown['delta']) + [end_point]
+            y = [round(y, 6) for y in y]
+            x = ['cmp_value'] + list(delta_drilldown['dim_grp']) + ['obs_value']
+
+        import plotly.graph_objects as go
+
+        fig = go.Figure()
+
+        fig.add_trace(go.Waterfall(
+            name="contribution", orientation="v",
+            measure=["initial"] + ['relative'] * (len(y) - 2) + ["total"],
+            x=x,
+            textposition="outside",
+            text=[str(x) for x in y],
+            y=y,
+            connector={"line": {"color": "rgb(63, 63, 63)"}}))
+
+        fig.update_layout(title='delta_drilldown_waterfall_chart',
+                          showlegend=True,
+                          waterfallgroupgap=0.1)
+
+        return fig
+
+    def waterfal_flow(self, summary_fa, ctb_df):
+        '''画图功能，生成瀑布图（仅在jupyter预发布环境可用）
+        更新版：拆分两种核心方法，维度拆解画图可以选择是否拆分rate和weight的贡献
+        summary_fa：漏斗拆解输出参数1
+        ctb_df：漏斗拆解输出参数2
+        '''
+        stt_point = summary_fa.loc['cmp', 'label']
+        end_point = summary_fa.loc['obs', 'label']
+
+        y = [stt_point] + list(ctb_df['ctb']) + [end_point]
+        y = [round(y, 6) for y in y]
+        x = ['cmp_value'] + list(ctb_df['label']) + ['obs_value']
+
+        import plotly.graph_objects as go
+
+        fig = go.Figure()
+
+        fig.add_trace(go.Waterfall(
+            name="contribution", orientation="v",
+            measure=["initial"] + ['relative'] * (len(y) - 2) + ["total"],
+            x=x,
+            textposition="outside",
+            text=[str(x) for x in y],
+            y=y,
+            connector={"line": {"color": "rgb(63, 63, 63)"}}))
+
+        fig.update_layout(title='flow_analysis_waterfall_chart',
+                          showlegend=True,
+                          waterfallgroupgap=0.1)
+
+        return fig
